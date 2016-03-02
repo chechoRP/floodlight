@@ -1,10 +1,11 @@
 package net.floodlightcontroller.arpresponder;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.ConcurrentMap;
 
 import org.projectfloodlight.openflow.types.IPv4Address;
+import org.projectfloodlight.openflow.types.MacAddress;
+import org.restlet.resource.Delete;
 import org.restlet.resource.Get;
 import org.restlet.resource.Post;
 import org.restlet.resource.ServerResource;
@@ -20,15 +21,28 @@ public class ARPResponderResource extends ServerResource {
 	protected static Logger log = LoggerFactory.getLogger(ARPResponderResource.class);
 
 	@Get("json")
-    public List<String> retrieveSubnets() {
+    public ConcurrentMap<String, String> retrieveGateways() {
 		IARPResponderService iarpr = (IARPResponderService)getContext().getAttributes().get(IARPResponderService.class.getCanonicalName());
-        List<String> l = new ArrayList<String>();
-        l.addAll(iarpr.getSubnets());
-        return l;
+		return iarpr.getGateways();
+    }
+	
+	@Delete
+	public String clearGateways() {
+		IARPResponderService iarpr = (IARPResponderService)getContext().getAttributes().get(IARPResponderService.class.getCanonicalName());
+		iarpr.clearGateways();
+		return "{\"status\" : \"Gateways Removed\"}";
+    }
+	
+	@Delete
+	public String clearGateway() {
+		IARPResponderService iarpr = (IARPResponderService)getContext().getAttributes().get(IARPResponderService.class.getCanonicalName());
+		String param = (String) getRequestAttributes().get("ip");
+		iarpr.clearGateway(IPv4Address.of(param));
+		return "{\"status\" : \"Gateway Removed\"}";
     }
 	
 	/**
-	 * parse a JSON string into an IPv4 Address, then add it to subnets
+	 * parse a JSON string into an IPv4 Address, then add it to gateways
 	 * @return A string status message
 	 */
 	@Post
@@ -38,35 +52,35 @@ public class ARPResponderResource extends ServerResource {
 				get(IARPResponderService.class.getCanonicalName());
 
 		IPv4Address ip = jsonToIp(fmtJson);
-		if (ip == null) {
-			return "{\"status\" : \"Error! Could not parse subnet ip.\"}";
+		MacAddress mac = jsonToMac(fmtJson);
+		if (ip == null || mac == null) {
+			return "{\"status\" : \"Error! Could not parse gateway.\"}";
 		}
 		String status = null;
-		if (iarpr.getSubnets().contains(ip.toString())) {
-			status = "Error! Subnet ip already exists.";
+		if (iarpr.getGateways().containsKey(ip.toString())) {
+			status = "Error! Gateway already exists.";
 			log.error(status);
 			return ("{\"status\" : \"" + status + "\"}");
 		} else {
-			// add subnet to ARP Responder
-			iarpr.addSubnet(ip);
-			status = "Subnet added";
+			// add gateway to ARP Responder
+			iarpr.addGateway(ip, mac);
+			status = "Gateway added";
 			return ("{\"status\" : \"" + status + "\", \"ip\" : \""+ ip.toString() + "\"}");
 		}
 	}
 		
 	private IPv4Address jsonToIp(String fmtJson) {
-		System.out.println(fmtJson);
 		IPv4Address ip = null;
 		JsonFactory jsonfactory = new JsonFactory();
 		try {
 			JsonParser jp = jsonfactory.createParser(fmtJson);
 			while (jp.nextToken() != JsonToken.END_OBJECT){
 				String token = jp.getCurrentName();
-				if ("subnet".equals(token)){
+				if ("ip".equals(token)){
 					jp.nextToken();
 					ip = IPv4Address.of(jp.getText());
 					break;
-				} 
+				}
 			}
 		} catch (JsonParseException e) {
 			e.printStackTrace();
@@ -75,6 +89,26 @@ public class ARPResponderResource extends ServerResource {
 		}
 
 		return ip;
+	}
+	private MacAddress jsonToMac(String fmtJson) {
+		MacAddress mac = null;
+		JsonFactory jsonfactory = new JsonFactory();
+		try {
+			JsonParser jp = jsonfactory.createParser(fmtJson);
+			while (jp.nextToken() != JsonToken.END_OBJECT){
+				String token = jp.getCurrentName();
+				if ("mac".equals(token)){
+					jp.nextToken();
+					mac = MacAddress.of(jp.getText());
+					break;
+				} 
+			}
+		} catch (JsonParseException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		return mac;
 	}
 }
 

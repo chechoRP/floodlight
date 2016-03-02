@@ -49,7 +49,7 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 	protected IRestApiService restApi;
 	/* Local data structures*/
 	protected ConcurrentMap<DatapathId, ConcurrentMap<IPv4Address, PortMACTuple>> arpTable;
-	protected List<IPv4Address> subnets;
+	protected ConcurrentMap<IPv4Address, MacAddress> gateways;
 
 	/* Pending to fix bug for outstanding ARP packets with a TIMER. If
 	 * subnets are not installed, the controller basically freaks out.*/
@@ -135,7 +135,7 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 		restApi = context.getServiceImpl(IRestApiService.class);
 		logger = LoggerFactory.getLogger(ARPResponder.class);
 		arpTable = new ConcurrentHashMap<DatapathId,ConcurrentMap<IPv4Address, PortMACTuple>>();
-		subnets = new ArrayList<IPv4Address>();
+		gateways = new ConcurrentHashMap<IPv4Address, MacAddress>();
 		/* This should be added via REST API not hard-coded*/
 		//subnets.add(IPv4Address.of("192.168.10.1"));
 		//subnets.add(IPv4Address.of("192.168.50.1"));
@@ -175,8 +175,6 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 		Ethernet ethPacket = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
 		// If this is not an ARP message, continue to next module.
 		if (ethPacket.getEtherType() != EthType.ARP ){
-//			if (ethPacket.getEtherType() != EthType.LLDP)
-//				System.out.println(ethPacket); // Don't print LLDP packets
 			return Command.CONTINUE;
 		}
 		/* Create new ARP packet from Ethernet frame*/
@@ -238,7 +236,7 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 		IPv4Address sourceIPAddress = arp.getSenderProtocolAddress();
 		/* The known MAC address of the ARP source. */
 		MacAddress sourceMACAddress = arp.getSenderHardwareAddress();
-		/* The IP address of the (yet unknown) ARP target. */
+		/* The target IP address of the ARP Request. */
 		IPv4Address targetIPAddress = arp.getTargetProtocolAddress();
 		/* The MAC address of the (yet unknown) ARP target. */
 		MacAddress targetMACAddress = MacAddress.NONE;
@@ -246,22 +244,13 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 		PortMACTuple tuple = new PortMACTuple(inPort, sourceMACAddress);
 		if (!arpTable.containsKey(id)){
 			// We know nothing about this switch ... initialize and add host location
-			ConcurrentMap<IPv4Address, PortMACTuple> ip2tuple = 
+			ConcurrentMap<IPv4Address, PortMACTuple> ipToTuple = 
 					new ConcurrentHashMap<IPv4Address, PortMACTuple>();
-			ip2tuple.put(sourceIPAddress, tuple);
-			arpTable.put(id, ip2tuple);
+			ipToTuple.put(sourceIPAddress, tuple);
+			arpTable.put(id, ipToTuple);
 			if (logger.isInfoEnabled()) {
                 logger.info("Creating entry for switch {} in ARP Table", id);
             }
-//			System.out.println(" ARP table contents: " +  arpTable);
-		} 
-		
-		if (subnets.contains(targetIPAddress)){
-			// If the target IP is a Subnet, add Subnet to switch that received ARP, extract 
-			// MAC address of inport via SwitchManager and remove address from the subnet list
-			arpTable.get(id).put(targetIPAddress, new PortMACTuple(inPort, 
-					switchManager.getSwitch(id).getPort(inPort).getHwAddr()));
-			subnets.remove(targetIPAddress);
 		}
 		
 		if (logger.isInfoEnabled()) {
@@ -271,22 +260,40 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 					+ inPort + " for target: " + targetIPAddress);
 //			logger.info("ARP Table " + arpTable);
 		}
+		
+		if (gateways.containsKey(targetIPAddress)){
+			// If target IP is in the gateways table. Send ARP Reply with information from that table 
+			this.sendARPReply(id, inPort, targetIPAddress, gateways.get(targetIPAddress),
+					sourceIPAddress, sourceMACAddress);
+			return Command.CONTINUE;
+		}
+
+/*
+		if (subnets.contains(targetIPAddress)){
+			// If the target IP is a Subnet, add Subnet to switch that received ARP, extract 
+			// MAC address of inport via SwitchManager and remove address from the subnet list
+			arpTable.get(id).put(targetIPAddress, new PortMACTuple(inPort, 
+					switchManager.getSwitch(id).getPort(inPort).getHwAddr()));
+			subnets.remove(targetIPAddress);
+		}
+		
+*/		
 		if (arpTable.get(id).containsKey(targetIPAddress)){
 			// If controller knows information of Target IP, send out an ARP Reply
 			targetMACAddress = arpTable.get(id).get(targetIPAddress).getMac();
-			this.sendARPReply(id, inPort, sourceIPAddress, sourceMACAddress,
-					targetIPAddress, targetMACAddress);
+			this.sendARPReply(id, inPort, targetIPAddress, targetMACAddress,
+					sourceIPAddress, sourceMACAddress);
 		} else {
 			// Otherwise, send an ARP request out.
 			this.sendARPRequest(id, inPort, sourceIPAddress, sourceMACAddress,
 					targetIPAddress, targetMACAddress);
 		}
-		return null;
+		return Command.CONTINUE;
 	}
 	
 	private net.floodlightcontroller.core.IListener.Command handleARPReply(
 			ARP arp, DatapathId id, OFPort inPort, FloodlightContext cntx) {
-		return null;
+		return Command.CONTINUE;
 	}
 	
 	/**
@@ -340,11 +347,12 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 	 * 
 	 * @param arpRequest The ARPRequest object containing information regarding the current ARP process.
 	 */
-	protected void sendARPReply(DatapathId id, OFPort inPort, IPv4Address srcIp, MacAddress srcMac, IPv4Address dstIp, MacAddress dstMac) {
+	protected void sendARPReply(DatapathId id, OFPort inPort, IPv4Address srcIp, MacAddress srcMac,
+			IPv4Address dstIp, MacAddress dstMac) {
 		// Create an ARP reply frame (from target (source) to source (destination)).
 		IPacket arpReply = new Ethernet()
-    		.setSourceMACAddress(dstMac)
-        	.setDestinationMACAddress(srcMac)
+    		.setSourceMACAddress(srcMac)
+        	.setDestinationMACAddress(dstMac)
         	.setEtherType(EthType.ARP)
         	.setPayload(new ARP()
 				.setHardwareType(ARP.HW_TYPE_ETHERNET)
@@ -352,10 +360,10 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 				.setOpCode(ARP.OP_REPLY)
 				.setHardwareAddressLength((byte)6)
 				.setProtocolAddressLength((byte)4)
-				.setSenderHardwareAddress(dstMac)
-				.setSenderProtocolAddress(dstIp)
-				.setTargetHardwareAddress(srcMac)
-				.setTargetProtocolAddress(srcIp)
+				.setSenderHardwareAddress(srcMac)
+				.setSenderProtocolAddress(srcIp)
+				.setTargetHardwareAddress(dstMac)
+				.setTargetProtocolAddress(dstIp)
 				.setPayload(new Data(new byte[] {0x01})));
 		// Send ARP reply.
 		sendPOMessage(arpReply, switchManager.getSwitch(id), inPort);
@@ -387,20 +395,36 @@ public class ARPResponder implements IFloodlightModule, IOFMessageListener, IARP
 	}
 
 	@Override
-	public void addSubnet(IPv4Address subnet) {
-		this.subnets.add(subnet);
+	public void addGateway(IPv4Address ip, MacAddress mac) {
+		this.gateways.put(ip,mac);
 		if (logger.isInfoEnabled()) {
-			logger.info("Subnet Added via REST: " + subnet);
+			logger.info("Gateway Added via REST: " + ip + " at: " + mac );
 		}
 	}
 
 	@Override
-	public List<String> getSubnets() {
-		List<String> subnetStr = new ArrayList<String>();
-		for (IPv4Address ip: this.subnets){
-			subnetStr.add(ip.toString());
+	public void clearGateways() {
+		this.gateways.clear();
+		if (logger.isInfoEnabled()) {
+			logger.info("Gateways cleared from controller");
 		}
-		return subnetStr;
+	}
+
+	@Override
+	public void clearGateway(IPv4Address ip) {
+		this.gateways.remove(ip);
+		if (logger.isInfoEnabled()) {
+			logger.info("Gateway "+ ip.toString() + " removed from controller");
+		}
+	}
+	
+	@Override
+	public ConcurrentMap<String, String> getGateways() {
+		ConcurrentHashMap<String, String> gws = new ConcurrentHashMap<String, String>();
+		for (IPv4Address ip: this.gateways.keySet()){
+			gws.put(ip.toString(), this.gateways.get(ip).toString());
+		}
+		return gws;
 	}
 }
 
